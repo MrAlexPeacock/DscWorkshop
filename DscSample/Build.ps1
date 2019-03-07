@@ -1,59 +1,34 @@
 [CmdletBinding()]
 param (
-    [String]
-    $buildOutput = 'BuildOutput',
-    
-    [String]
+    [string]
+    $BuildOutput = 'BuildOutput',
+
+    [string]
     $ResourcesFolder = 'DSC_Resources',
 
-    [String]
+    [string]
     $ConfigDataFolder = 'DSC_ConfigData',
-    
-    [String]
+
+    [string]
     $ConfigurationsFolder = 'DSC_Configurations',
 
-    [String]
+    [string]
     $TestFolder = 'Tests',
 
     [ScriptBlock]
     $Filter = {},
 
-    [int]$MofCompilationTaskCount,
-    
-    [switch]$RandomWait,
+    [int]
+    $MofCompilationTaskCount = 1,
 
-    $Environment = $(
-        $branch = $env:BranchName
-        $branch = if ($branch -eq 'master')
-        { 'Prod' 
-        }
-        else
-        { 'Dev' 
-        }
-        if (Test-Path -Path ".\$ConfigDataFolder\AllNodes\$branch")
-        {
-            $branch
-        }
-        else
-        {
-            'Dev'
-        }
-    ),
-    
-    $BuildVersion = $(
-        if ($gitshortid = (& git rev-parse --short HEAD))
-        {$gitshortid
-        }
-        else
-        {'0.0.0' 
-        }
-    ),
+    [string]
+    $Environment,
 
-    [String[]]
-    $GalleryRepository, #used in ResolveDependencies, has default
+    [string]
+    $GalleryRepository = 'PSGallery',
 
-    [Uri]
-    $GalleryProxy, #used in ResolveDependencies, $null if not specified
+    [uri]
+    $GalleryProxy,
 
     [Switch]
     $ForceEnvironmentVariables = $true,
@@ -61,16 +36,16 @@ param (
     [Parameter(Position = 0)]
     $Tasks,
 
-    [Switch]
+    [switch]
     $ResolveDependency,
 
-    [String]
+    [string]
     $ProjectPath,
 
-    [Switch]
+    [switch]
     $DownloadResourcesAndConfigurations,
 
-    [Switch]
+    [switch]
     $Help,
 
     [ScriptBlock]
@@ -88,134 +63,149 @@ param (
 )
 
 [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
+Add-Type -AssemblyName System.Threading
+$m = [System.Threading.Mutex]::new($false, 'DscBuildProcess')
+
+#changing the path is required to make PSDepend run without internet connection. It is required to download nutget.exe once first:
+#Invoke-WebRequest -Uri 'https://aka.ms/psget-nugetexe' -OutFile C:\ProgramData\Microsoft\Windows\PowerShell\PowerShellGet\nuget.exe -ErrorAction Stop
+$pathElements = $env:Path -split ';'
+$pathElements += 'C:\ProgramData\Microsoft\Windows\PowerShell\PowerShellGet'
+$env:Path = $pathElements -join ';'
 
 #cannot be a default parameter value due to https://github.com/PowerShell/PowerShell/issues/4688
-if (-not $ProjectPath)
-{
+if (-not $ProjectPath) {
     $ProjectPath = $PSScriptRoot
 }
 
-if (!([System.IO.Path]::IsPathRooted($buildOutput)))
-{
-    $buildOutput = Join-Path -Path $ProjectPath -ChildPath $buildOutput
+if (-not ([System.IO.Path]::IsPathRooted($BuildOutput))) {
+    $BuildOutput = Join-Path -Path $ProjectPath -ChildPath $BuildOutput
 }
 
-$buildModulesPath = Join-Path -Path $buildOutput -ChildPath 'Modules'
-if (!(Test-Path -Path $buildModulesPath))
-{
+$buildModulesPath = Join-Path -Path $BuildOutput -ChildPath 'Modules'
+if (-not (Test-Path -Path $buildModulesPath)) {
     $null = mkdir -Path $buildModulesPath -Force
 }
 
-if ($buildModulesPath -notin ($Env:PSModulePath -split ';'))
-{
-    $env:PSModulePath = "$buildModulesPath;$Env:PSModulePath"
+$psModulePathElemets = $env:PSModulePath -split ';'
+if ($buildModulesPath -notin $psModulePathElemets) {
+    $env:PSModulePath = $psModulePathElemets -join ';'
+    $env:PSModulePath += ";$buildModulesPath"
 }
 
-if (-not (Get-Module -Name InvokeBuild -ListAvailable) -and -not $ResolveDependency)
-{
+#importing all resources from .build directory
+Get-ChildItem -Path "$PSScriptRoot/.build/" -Recurse -Include *.ps1 |
+    ForEach-Object {
+    Write-Verbose "Importing file $($_.BaseName)"
+    try {
+        . $_.FullName
+    }
+    catch { }
+}
+
+if (-not (Get-Module -Name InvokeBuild -ListAvailable) -and -not $ResolveDependency) {
     Write-Error "Requirements are missing. Please call the script again with the switch 'ResolveDependency'"
     return
 }
 
-if ($ResolveDependency)
-{
+if ($ResolveDependency) {
     . $PSScriptRoot/.build/BuildHelpers/Resolve-Dependency.ps1
     Resolve-Dependency
 }
 
-Get-ChildItem -Path "$PSScriptRoot/.build/" -Recurse -Include *.ps1 |
-    ForEach-Object {
-        Write-Verbose "Importing file $($_.BaseName)"
-        try {
-            . $_.FullName
-        }
-        catch { }
-    }
-
-if ($MyInvocation.ScriptName -notlike '*Invoke-Build.ps1')
-{
-    if ($ResolveDependency -or $PSBoundParameters['ResolveDependency'])
-    {
+if ($MyInvocation.ScriptName -notlike '*Invoke-Build.ps1') {
+    if ($ResolveDependency -or $PSBoundParameters['ResolveDependency']) {
         $PSBoundParameters.Remove('ResolveDependency')
         $PSBoundParameters['DownloadResourcesAndConfigurations'] = $true
     }
 
-    if ($Help)
-    {
+    if ($Help) {
         Invoke-Build ?
     }
-    else
-    {
+    else {
+        $PSBoundParameters.Remove('Tasks') | Out-Null
         Invoke-Build -Tasks $Tasks -File $MyInvocation.MyCommand.Path @PSBoundParameters
-            
-        if ($MofCompilationTaskCount)
-        {
+
+        if ($MofCompilationTaskCount -gt 1) {
             $global:splittedNodes = Split-Array -List $ConfigurationData.AllNodes -ChunkCount $MofCompilationTaskCount
-            
-            if ($MofCompilationTaskCount)
-            {
-                $mofCompilationTasks = foreach ($nodeSet in $global:splittedNodes)
-                {
-                    $nodeNamesInSet = "'$($nodeSet.Name -join "', '")'"
-                    $filterString = '$_.NodeName -in {0}' -f $nodeNamesInSet
-                    $PSBoundParameters.Filter = [scriptblock]::Create($filterString)
-                
-                    @{ 
-                        File                 = $MyInvocation.MyCommand.Path
-                        Task                 = 'PSModulePath_BuildModules',
-                        'Load_Datum_ConfigData',
-                        'Compile_Datum_Rsop',
-                        'Compile_Root_Configuration',
-                        'Compile_Root_Meta_Mof'
-                        Filter               = [scriptblock]::Create($filterString)
-                        RandomWait           = $true
-                        BuildOutput          = $buildOutput
-                        ResourcesFolder      = $ResourcesFolder
-                        ConfigDataFolder     = $ConfigDataFolder
-                        ConfigurationsFolder = $ConfigurationsFolder
-                        TestFolder           = $TestFolder
-                        Environment          = $Environment
-                    }
+
+            $mofCompilationTasks = foreach ($nodeSet in $global:splittedNodes) {
+                $nodeNamesInSet = "'$($nodeSet.Name -join "', '")'"
+                $filterString = '$_.NodeName -in {0}' -f $nodeNamesInSet
+                $PSBoundParameters.Filter = [scriptblock]::Create($filterString)
+
+                @{
+                    File                    = $MyInvocation.MyCommand.Path
+                    Task                    = 'WaitForMutex',
+                    'LoadDatumConfigData',
+                    'CompileDatumRsop',
+                    'CompileRootConfiguration',
+                    'CompileRootMetaMof'
+                    Filter                  = [scriptblock]::Create($filterString)
+                    MofCompilationTaskCount = $MofCompilationTaskCount
+                    ProjectPath             = $ProjectPath
+                    BuildOutput             = $buildOutput
+                    ResourcesFolder         = $ResourcesFolder
+                    ConfigDataFolder        = $ConfigDataFolder
+                    ConfigurationsFolder    = $ConfigurationsFolder
+                    TestFolder              = $TestFolder
+                    Environment             = $Environment
                 }
-                Build-Parallel $mofCompilationTasks
             }
+            Build-Parallel $mofCompilationTasks
         }
-        return
     }
+
+    if (($Tasks -contains 'CompileRootConfiguration' -and $Tasks -contains 'CompileRootMetaMof') -or -not $Tasks) {
+        Invoke-Build -File "$ProjectPath\PostBuild.ps1"
+    }
+
+    $m.Dispose()
+    Write-Host "Created $((Get-ChildItem -Path "$BuildOutput\MOF" -Filter *.mof).Count) MOF files in '$BuildOutput/MOF'" -ForegroundColor Green
+
+    #Debug Output
+    Write-Host "------------------------------------" -ForegroundColor Magenta
+    Write-Host "PowerShell Variables" -ForegroundColor Magenta
+    Get-Variable | Out-String | Write-Host -ForegroundColor Magenta
+    Write-Host "------------------------------------" -ForegroundColor Magenta
+    Write-Host "Environment Variables" -ForegroundColor Magenta
+    dir env: | Out-String | Write-Host -ForegroundColor Magenta
+    Write-Host "------------------------------------" -ForegroundColor Magenta
+    
+    return
 }
 
-if ($TaskHeader)
-{
+if ($TaskHeader) {
     Set-BuildHeader $TaskHeader
 }
 
-if ($MofCompilationTaskCount)
-{
-    task . Clean_BuildOutput, 
-    Download_All_Dependencies, 
-    PSModulePath_BuildModules, 
-    Test_ConfigData,
-    Load_Datum_ConfigData    
-    #Create_Mof_Checksums, # or use the meta-task: Compile_Datum_DSC,
-    #Zip_Modules_For_Pull_Server
+if ($MofCompilationTaskCount -gt 1) {
+    task . Init,
+    CleanBuildOutput,
+    SetPsModulePath,
+    Download_All_Dependencies,
+    TestConfigData,
+    VersionControl,
+    LoadDatumConfigData
 }
-else
-{
-    task . Clean_BuildOutput,
-    #Download_All_Dependencies,
-    PSModulePath_BuildModules,
-    Test_ConfigData,
-    Load_Datum_ConfigData,
-    Compile_Datum_Rsop,
-    Compile_Root_Configuration,
-    Compile_Root_Meta_Mof
-    #Create_Mof_Checksums, # or use the meta-task: Compile_Datum_DSC,
-    #Zip_Modules_For_Pull_Server
-    #Deployment
+else {
+    if (-not $Tasks) {
+        task . Init,
+        CleanBuildOutput,
+        SetPsModulePath,
+        TestConfigData,
+        VersionControl,
+        LoadDatumConfigData,
+        CompileDatumRsop,
+        CompileRootConfiguration,
+        CompileRootMetaMof
+    }
+    else {
+        task . $Tasks
+    }
 }
 
-task Download_All_Dependencies -if ($DownloadResourcesAndConfigurations -or $Tasks -contains 'Download_All_Dependencies') Download_DSC_Configurations, Download_DSC_Resources -Before PSModulePath_BuildModules
-    
+task Download_All_Dependencies -if ($DownloadResourcesAndConfigurations -or $Tasks -contains 'Download_All_Dependencies') Download_DSC_Configurations, Download_DSC_Resources -Before SetPsModulePath
+
 $configurationPath = Join-Path -Path $ProjectPath -ChildPath $ConfigurationsFolder
 $resourcePath = Join-Path -Path $ProjectPath -ChildPath $ResourcesFolder
 $configDataPath = Join-Path -Path $ProjectPath -ChildPath $ConfigDataFolder
@@ -223,18 +213,26 @@ $testsPath = Join-Path -Path $ProjectPath -ChildPath $TestFolder
 
 task Download_DSC_Resources {
     $PSDependResourceDefinition = "$ProjectPath\PSDepend.DSC_Resources.psd1"
-    if (Test-Path $PSDependResourceDefinition)
-    {
-        Invoke-PSDepend -Path $PSDependResourceDefinition -Confirm:$false -Target $resourcePath
+    if (Test-Path $PSDependResourceDefinition) {
+        $psDependParams = @{
+            Path    = $PSDependResourceDefinition
+            Confirm = $false
+            Target  = $resourcePath
+        }
+        Invoke-PSDependInternal -PSDependParameters $psDependParams -Reporitory $GalleryRepository
     }
 }
 
 task Download_DSC_Configurations {
     $PSDependConfigurationDefinition = "$ProjectPath\PSDepend.DSC_Configurations.psd1"
-    if (Test-Path $PSDependConfigurationDefinition)
-    {
+    if (Test-Path $PSDependConfigurationDefinition) {
         Write-Build Green 'Pull dependencies from PSDepend.DSC_Configurations.psd1'
-        Invoke-PSDepend -Path $PSDependConfigurationDefinition -Confirm:$false -Target $configurationPath
+        $psDependParams = @{
+            Path    = $PSDependConfigurationDefinition
+            Confirm = $false
+            Target  = $configurationPath
+        }
+        Invoke-PSDependInternal -PSDependParameters $psDependParams -Reporitory $GalleryRepository
     }
 }
 
@@ -244,30 +242,4 @@ task Clean_DSC_Resources_Folder {
 
 task Clean_DSC_Configurations_Folder {
     Get-ChildItem -Path "$ConfigurationsFolder" -Recurse | Remove-Item -Force -Recurse -Exclude README.md
-}
-
-task Zip_Modules_For_Pull_Server {
-    if (!([System.IO.Path]::IsPathRooted($buildOutput)))
-    {
-        $BuildOutput = Join-Path $PSScriptRoot -ChildPath $BuildOutput
-    }
-    Import-Module DscBuildHelpers -ErrorAction Stop
-    Get-ModuleFromfolder -ModuleFolder (Join-Path $ProjectPath -ChildPath $ResourcesFolder) |
-        Compress-DscResourceModule -DscBuildOutputModules (Join-Path $BuildOutput -ChildPath 'DscModules') -Verbose:$false 4>$null
-}
-
-task Test_ConfigData {
-    if (!(Test-Path -Path $testsPath))
-    {
-        Write-Build Yellow "Path for tests '$testsPath' does not exist"
-        return
-    }
-    if (!([System.IO.Path]::IsPathRooted($BuildOutput)))
-    {
-        $BuildOutput = Join-Path -Path $PSScriptRoot -ChildPath $BuildOutput
-    }
-    $testResultsPath = Join-Path -Path $BuildOutput -ChildPath TestResults.xml
-    $testResults = Invoke-Pester -Script $testsPath -PassThru -OutputFile $testResultsPath -OutputFormat NUnitXml
-
-    assert ($testResults.FailedCount -eq 0)
 }

@@ -1,11 +1,11 @@
 Configurations:
-  - RegistryValues
   - SecurityBase
   - WindowsFeatures
-
-SecurityBase:
-  SecurityLevel: 1
+  - NetworkIpConfiguration
 
 WindowsFeatures:
   Name:
-    - -XPS-Viewer
+    - -Telnet-Client
+
+SecurityBase:
+  Role: Baseline
